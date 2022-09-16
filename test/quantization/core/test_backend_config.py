@@ -42,12 +42,21 @@ class TestBackendConfig(QuantizationTestCase):
         "output_dtype": torch.quint8,
         "weight_dtype": torch.qint8,
         "bias_dtype": torch.float,
+        "input_dtype_with_constraints": {
+            "dtype": torch.quint8,
+        },
+        "weight_dtype_with_constraints": {
+            "dtype": torch.qint8,
+        },
     }
 
     dtype_config_dict2 = {
         "input_dtype": torch.float16,
         "output_dtype": torch.float,
         "is_dynamic": True,
+        "input_dtype_with_constraints": {
+            "dtype": torch.float16,
+        },
     }
 
     def test_dtype_config_from_dict(self):
