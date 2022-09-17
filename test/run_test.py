@@ -14,7 +14,6 @@ import sys
 import tempfile
 import json
 from typing import Dict, Optional, List, cast, Any
-from tools.testing.test_selections import LARGE_TEST
 
 import torch
 from torch.utils import cpp_extension
@@ -39,6 +38,7 @@ try:
         get_reordered_tests,
         get_test_case_configs,
         calculate_shards,
+        LARGE_TEST
     )
     HAVE_TEST_SELECTION_TOOLS = True
 except ImportError:
