@@ -39,7 +39,7 @@ def calculate_shards(
     must_serial = must_serial or (lambda x: True)
 
     unknown_tests: List[str] = [test for test in tests if test not in test_times]
-    tests = [test for test in tests in test not in unknown_tests]
+    tests = [test for test in tests if test not in unknown_tests]
 
     sorted_tests = sorted(tests, key=lambda j: test_times[j], reverse=True)
     serial = [x for x in sorted_tests if must_serial(x)]
