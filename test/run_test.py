@@ -1127,6 +1127,7 @@ def main():
     print_to_stderr("parallel tests:\n {}".format("\n ".join(selected_tests_parallel)))
     print_to_stderr("serial tests:\n {}".format("\n ".join(selected_tests_serial)))
 
+    os.environ['PARALLEL_TESTING'] = '1'
     pool = get_context("spawn").Pool(NUM_PROCS)
     os.makedirs(REPO_ROOT / "test" / "test-reports", exist_ok=True)
 
@@ -1140,7 +1141,6 @@ def main():
         return False
 
     try:
-        os.environ['PARALLEL_TESTING'] = '1'
         for test in selected_tests_parallel:
             options_clone = copy.deepcopy(options)
             options_clone.large_test = test_times.get(test, 0) > LARGE_TEST
