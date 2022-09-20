@@ -1143,7 +1143,7 @@ def main():
     try:
         for test in selected_tests_parallel:
             options_clone = copy.deepcopy(options)
-            options_clone.large_test = test_times.get(test, 0) > LARGE_TEST
+            options_clone.large_test = test_times is not None and test_times.get(test, 0) > LARGE_TEST
             pool.apply_async(run_test_module, args=(test, test_directory, options_clone), callback=success_callback)
         pool.close()
         pool.join()
@@ -1154,7 +1154,7 @@ def main():
 
         for test in selected_tests_serial:
             options_clone = copy.deepcopy(options)
-            options_clone.large_test = test_times.get(test, 0) > LARGE_TEST
+            options_clone.large_test = test_times is not None and test_times.get(test, 0) > LARGE_TEST
             err_message = run_test_module(test, test_directory, options_clone)
             if err_message is None:
                 continue
