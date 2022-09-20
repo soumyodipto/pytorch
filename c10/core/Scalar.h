@@ -9,6 +9,7 @@
 
 #include <c10/core/OptionalRef.h>
 #include <c10/core/ScalarType.h>
+#include <c10/core/SymInt.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
 #include <c10/util/Half.h>
@@ -36,6 +37,16 @@ class C10_API Scalar {
 #define DEFINE_IMPLICIT_CTOR(type, name) \
   Scalar(type vv) : Scalar(vv, true) {}
 
+  void destroy() {
+    if (Tag::HAS_si == tag) {
+      v.si.release_();
+    }
+  }
+
+  ~Scalar() {
+    destroy();
+  }
+
   AT_FORALL_SCALAR_TYPES_AND3(Half, BFloat16, ComplexHalf, DEFINE_IMPLICIT_CTOR)
   AT_FORALL_COMPLEX_TYPES(DEFINE_IMPLICIT_CTOR)
 
@@ -49,21 +60,32 @@ class C10_API Scalar {
       typename std::enable_if<std::is_same<T, bool>::value, bool>::type* =
           nullptr>
   Scalar(T vv) : tag(Tag::HAS_b) {
-    v.i = convert<int64_t, bool>(vv);
+    v.u.i = convert<int64_t, bool>(vv);
   }
 
-#define DEFINE_ACCESSOR(type, name)                                   \
-  type to##name() const {                                             \
-    if (Tag::HAS_d == tag) {                                          \
-      return checked_convert<type, double>(v.d, #type);               \
-    } else if (Tag::HAS_z == tag) {                                   \
-      return checked_convert<type, c10::complex<double>>(v.z, #type); \
-    }                                                                 \
-    if (Tag::HAS_b == tag) {                                          \
-      return checked_convert<type, bool>(v.i, #type);                 \
-    } else {                                                          \
-      return checked_convert<type, int64_t>(v.i, #type);              \
-    }                                                                 \
+#define DEFINE_ACCESSOR(type, name)                                     \
+  type to##name() const {                                               \
+    if (Tag::HAS_d == tag) {                                            \
+      return checked_convert<type, double>(v.u.d, #type);               \
+    } else if (Tag::HAS_z == tag) {                                     \
+      return checked_convert<type, c10::complex<double>>(v.u.z, #type); \
+    }                                                                   \
+    if (Tag::HAS_b == tag) {                                            \
+      return checked_convert<type, bool>(v.u.i, #type);                 \
+    } else if (Tag::HAS_i == tag) {                                     \
+      return checked_convert<type, int64_t>(v.u.i, #type);              \
+    } else if (Tag::HAS_si == tag) {                                    \
+      TORCH_CHECK(false)                                                \
+    }                                                                   \
+    TORCH_CHECK(false)                                                  \
+  }
+
+  SymInt toSymInt() const {
+    if (Tag::HAS_si == tag) {
+      return v.si;
+    } else {
+      return toLong();
+    }
   }
 
   // TODO: Support ComplexHalf accessor
@@ -74,7 +96,9 @@ class C10_API Scalar {
   template <typename T>
   T to() const = delete;
 
+  // audit uses of data_ptr
   const void* data_ptr() const {
+    // error on symint
     return static_cast<const void*>(&v);
   }
 
@@ -86,10 +110,11 @@ class C10_API Scalar {
   C10_DEPRECATED_MESSAGE(
       "isIntegral is deprecated. Please use the overload with 'includeBool' parameter instead.")
   bool isIntegral() const {
-    return Tag::HAS_i == tag;
+    return Tag::HAS_i == tag || Tag::HAS_si == tag;
   }
   bool isIntegral(bool includeBool) const {
-    return Tag::HAS_i == tag || (includeBool && isBoolean());
+    return Tag::HAS_i == tag || Tag::HAS_si == tag ||
+        (includeBool && isBoolean());
   }
 
   bool isComplex() const {
@@ -97,6 +122,29 @@ class C10_API Scalar {
   }
   bool isBoolean() const {
     return Tag::HAS_b == tag;
+  }
+  // nb: does not include normal ints
+  bool isSymInt() const {
+    return Tag::HAS_si == tag;
+  }
+
+  C10_ALWAYS_INLINE Scalar& operator=(Scalar&& other) {
+    if (&other == this) {
+      return *this;
+    }
+
+    destroy();
+    moveFrom(std::move(other));
+    return *this;
+  }
+
+  C10_ALWAYS_INLINE Scalar& operator=(const Scalar& other) {
+    if (&other == this) {
+      return *this;
+    }
+
+    *this = Scalar(other);
+    return *this;
   }
 
   Scalar operator-() const;
@@ -108,12 +156,14 @@ class C10_API Scalar {
       typename std::enable_if<!c10::is_complex<T>::value, int>::type = 0>
   bool equal(T num) const {
     if (isComplex()) {
-      auto val = v.z;
+      auto val = v.u.z;
       return (val.real() == num) && (val.imag() == T());
     } else if (isFloatingPoint()) {
-      return v.d == num;
+      return v.u.d == num;
     } else if (isIntegral(/*includeBool=*/false)) {
-      return v.i == num;
+      // test if symint or not
+      // guard on bool
+      return v.u.i == num;
     } else {
       // boolean scalar does not equal to a non boolean value
       return false;
@@ -125,11 +175,12 @@ class C10_API Scalar {
       typename std::enable_if<c10::is_complex<T>::value, int>::type = 0>
   bool equal(T num) const {
     if (isComplex()) {
-      return v.z == num;
+      return v.u.z == num;
     } else if (isFloatingPoint()) {
-      return (v.d == num.real()) && (num.imag() == T());
+      return (v.u.d == num.real()) && (num.imag() == T());
     } else if (isIntegral(/*includeBool=*/false)) {
-      return (v.i == num.real()) && (num.imag() == T());
+      // test symint here
+      return (v.u.i == num.real()) && (num.imag() == T());
     } else {
       // boolean scalar does not equal to a non boolean value
       return false;
@@ -138,7 +189,7 @@ class C10_API Scalar {
 
   bool equal(bool num) const {
     if (isBoolean()) {
-      return static_cast<bool>(v.i) == num;
+      return static_cast<bool>(v.u.i) == num;
     } else {
       return false;
     }
@@ -158,14 +209,69 @@ class C10_API Scalar {
     }
   }
 
+  Scalar(Scalar&& rhs) noexcept : tag(rhs.tag) {
+    moveFrom(std::move(rhs));
+  }
+
+  Scalar(const Scalar& rhs) : Scalar(rhs.v, rhs.tag) {}
+
+  Scalar(c10::SymInt si) : tag(Tag::HAS_si) {
+    // test if int and turn to int
+    v.si = si;
+  }
+
+  C10_ALWAYS_INLINE void moveFrom(Scalar&& rhs) noexcept {
+    if (rhs.tag == Tag::HAS_si) {
+      new (&v.si) c10::SymInt(std::move(rhs.v.si));
+      rhs.v.si.release_();
+    } else {
+      v.u = rhs.v.u;
+    }
+    tag = rhs.tag;
+    rhs.clearToInt();
+  }
+
+  void clearToInt() noexcept {
+    v.u.i = 0;
+    tag = Tag::HAS_i;
+  }
+
+  // We can't set v in the initializer list using the
+  // syntax v{ .member = ... } because it doesn't work on MSVC
  private:
+  enum class Tag { HAS_d, HAS_i, HAS_z, HAS_b, HAS_si, HAS_sf };
+
+  union Payload {
+    // See [TriviallyCopyablePayload] in IValue.h,
+    union TriviallyCopyablePayload {
+      TriviallyCopyablePayload() : i(0) {}
+      double d;
+      int64_t i;
+      c10::complex<double> z;
+    } u;
+    Payload() : u() {}
+    ~Payload() {}
+    c10::SymInt si;
+  } v;
+
+  Tag tag;
+  Payload payload;
+
+  Scalar(const Payload& p, Scalar::Tag t) : tag(t) {
+    if (t == Tag::HAS_si) {
+      v.si = p.si;
+    } else {
+      v.u = p.u;
+    }
+  }
+
   template <
       typename T,
       typename std::enable_if<
           std::is_integral<T>::value && !std::is_same<T, bool>::value,
           bool>::type* = nullptr>
   Scalar(T vv, bool) : tag(Tag::HAS_i) {
-    v.i = convert<decltype(v.i), T>(vv);
+    v.u.i = convert<decltype(v.u.i), T>(vv);
   }
 
   template <
@@ -174,27 +280,15 @@ class C10_API Scalar {
           !std::is_integral<T>::value && !c10::is_complex<T>::value,
           bool>::type* = nullptr>
   Scalar(T vv, bool) : tag(Tag::HAS_d) {
-    v.d = convert<decltype(v.d), T>(vv);
+    v.u.d = convert<decltype(v.u.d), T>(vv);
   }
 
   template <
       typename T,
       typename std::enable_if<c10::is_complex<T>::value, bool>::type* = nullptr>
   Scalar(T vv, bool) : tag(Tag::HAS_z) {
-    v.z = convert<decltype(v.z), T>(vv);
+    v.u.z = convert<decltype(v.u.z), T>(vv);
   }
-
-  // We can't set v in the initializer list using the
-  // syntax v{ .member = ... } because it doesn't work on MSVC
-
-  enum class Tag { HAS_d, HAS_i, HAS_z, HAS_b };
-  Tag tag;
-  union v_t {
-    double d;
-    int64_t i;
-    c10::complex<double> z;
-    v_t() {} // default constructor
-  } v;
 };
 
 using OptionalScalarRef = c10::OptionalRef<Scalar>;
