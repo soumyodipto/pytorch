@@ -703,7 +703,6 @@ def sign(g: torchscript.GraphContext, self):
     return g.op("Sign", self)
 
 
-@symbolic_helper.quantized_args(True)
 @_beartype.beartype
 def _slice(g: torchscript.GraphContext, input, axes, starts, ends):
     assert len(starts) == len(ends)
