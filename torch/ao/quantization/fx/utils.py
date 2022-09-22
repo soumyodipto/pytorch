@@ -2,8 +2,19 @@ import copy
 import re
 import torch
 import torch.nn as nn
-from torch.ao.quantization import QuantType, QConfig
-from torch.ao.quantization.backend_config import BackendConfig
+from torch.ao.quantization import (
+    QuantType,
+    QConfigAny,
+)
+from torch.ao.quantization.backend_config import (
+    BackendConfig,
+    DTypeConfig,
+    DTypeWithConstraints,
+)
+from torch.ao.quantization.observer import (
+    _PartialWrapper,
+    ObserverBase,
+)
 from torch.ao.quantization.stubs import DeQuantStub
 from torch.ao.quantization.utils import (
     activation_is_statically_quantized,
@@ -11,6 +22,7 @@ from torch.ao.quantization.utils import (
     is_per_channel,
 )
 from torch.ao.quantization.quantize import is_activation_post_process
+from torch.ao.quantization.quantization_types import Pattern
 
 from torch.fx import GraphModule, map_arg
 
@@ -945,3 +957,51 @@ def _reroute_tuple_getitem_pattern(graph: Graph):
         new_input = first_tuple.args[0][last_getitem_index]  # type: ignore[index]
         for user in list(last_getitem.users.keys()):
             user.replace_input_with(last_getitem, new_input)
+
+def _validate_qconfig_against_dtype_config(
+        qconfig: QConfigAny,
+        dtype_config: DTypeConfig,
+        pattern: Pattern):
+    """
+    Validate whether the QConfig satisfies all of the following constraints from the backend:
+        1. QConfig specified a quantization range that falls within the backend's, if any
+        2. QConfig specified a min scale value that is >= the backend's min scale value, if any
+    """
+    def validate_activation_post_process(
+            activation_post_process_ctr: Union[_PartialWrapper, Type[ObserverBase]],
+            dtype_with_constraints: DTypeWithConstraints,
+            debug_string: str):
+        activation_post_process = activation_post_process_ctr()  # type: ignore[call-arg]
+        qconfig_quant_min = getattr(activation_post_process, "quant_min", None)
+        qconfig_quant_max = getattr(activation_post_process, "quant_max", None)
+        # TODO: for now, just use the existing eps value as scale_min. In the future, we should
+        # resolve the differences between the two, either by renaming eps or some other way
+        qconfig_scale_min = getattr(activation_post_process, "eps", None)
+        backend_quant_min = dtype_with_constraints.quant_min_lower_bound
+        backend_quant_max = dtype_with_constraints.quant_max_upper_bound
+        backend_scale_min = dtype_with_constraints.scale_min_lower_bound
+        # validate quantization ranges
+        if backend_quant_min is not None and backend_quant_max is not None:
+            if qconfig_quant_min is None or qconfig_quant_max is None:
+                raise ValueError("QConfig must specify 'quant_min' and 'quant_max' for '%s' %s:\n%s" %
+                                 (pattern, debug_string, qconfig))
+            elif qconfig_quant_min < backend_quant_min or qconfig_quant_max > backend_quant_max:
+                raise ValueError(("QConfig quantization range for '%s' %s must fall within the backend's:\n"
+                                 "QConfig = (%s, %s), BackendConfig = (%s, %s)\n%s") % (pattern, debug_string,
+                                 qconfig_quant_min, qconfig_quant_max, backend_quant_min, backend_quant_max, qconfig))
+        # validate scale min
+        if backend_scale_min is not None:
+            if qconfig_scale_min is None:
+                raise ValueError("QConfig must specify 'eps' for '%s' %s:\n%s" % (pattern, debug_string, qconfig))
+            elif qconfig_scale_min < backend_scale_min:
+                raise ValueError(("QConfig eps for '%s' %s (%s) must be greater than or equal to "
+                                 "the backend's min scale value (%s):\n%s") %
+                                 (pattern, debug_string, qconfig_scale_min, backend_scale_min, qconfig))
+    if qconfig is None:
+        return
+    if dtype_config.input_dtype is not None:
+        validate_activation_post_process(qconfig.activation, dtype_config.input_dtype, "activation")
+    if dtype_config.output_dtype is not None:
+        validate_activation_post_process(qconfig.activation, dtype_config.output_dtype, "activation")
+    if dtype_config.weight_dtype is not None:
+        validate_activation_post_process(qconfig.weight, dtype_config.weight_dtype, "weight")
