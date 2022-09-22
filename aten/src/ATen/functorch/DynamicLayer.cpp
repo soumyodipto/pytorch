@@ -128,6 +128,7 @@ class FuncTorchTLS : public FuncTorchTLSBase {
 
   std::vector<DynamicLayer> dynamicLayerStack;
   bool allow_inplace_requires_grad_ = false;
+  bool during_functorch_transform = false;
 };
 
 static FuncTorchTLS* getRawFunctorchTLS() {
@@ -149,6 +150,17 @@ void setInplaceRequiresGradAllowed(bool allowed) {
 bool getInplaceRequiresGradAllowed() {
   auto* functorch_tls = getRawFunctorchTLS();
   return functorch_tls->allow_inplace_requires_grad_;
+}
+
+
+void setDuringFunctorchTransform(bool during_transform) {
+  auto* functorch_tls = getRawFunctorchTLS();
+  functorch_tls->during_functorch_transform = during_transform;
+}
+
+bool getDuringFunctorchTransform() {
+  auto* functorch_tls = getRawFunctorchTLS();
+  return functorch_tls->during_functorch_transform;
 }
 
 
@@ -294,10 +306,24 @@ Tensor unwrapIfDead(const Tensor& tensor) {
 
 void foreachTensorInplace(std::vector<IValue>& args, int64_t begin, int64_t end,
     std::function<Tensor(const Tensor&)> func) {
+   auto func_with_bool = [&](const Tensor& tensor, bool unused) { return func(tensor); };
+   foreachTensorInplaceSkips(args, begin, end, std::vector<int64_t>(), func_with_bool);
+}
+
+void foreachTensorInplaceSkips(std::vector<IValue>& args, int64_t begin, int64_t end, std::vector<int64_t> relative_skips,
+    std::function<Tensor(const Tensor&, bool)> func){
   TORCH_INTERNAL_ASSERT(begin >= 0);
   TORCH_INTERNAL_ASSERT(end >= 0);
   TORCH_INTERNAL_ASSERT(begin <= end);
+  int64_t relative_skips_idx = 0;
   for (int64_t idx = begin; idx < end; idx++) {
+    bool skipped = false;
+    // until we're at the end of relative_skips, check if the current idx is in relative skips (offset by begin)
+    // and if it is, we skip this element and look at the next element in relative_skips. relative_skips must be sorted
+    if (relative_skips_idx <static_cast<int64_t>(relative_skips.size()) && idx == begin + relative_skips[relative_skips_idx]) {
+      relative_skips_idx++;
+      skipped = true;
+    }
     auto ivalue = args[idx];
     // Tensor?[] translates to a c10::List<IValue> so we need to peek inside List
     if (ivalue.isList()) {
@@ -307,7 +333,7 @@ void foreachTensorInplace(std::vector<IValue>& args, int64_t begin, int64_t end,
       for (const auto list_idx : c10::irange(0, list.size())) {
         const auto& elt = list.get(list_idx);
         if (elt.isTensor()) {
-          list.set(list_idx, func(elt.toTensor()));
+          list.set(list_idx, func(elt.toTensor(), skipped));
           modified = true;
         }
       }
@@ -319,7 +345,7 @@ void foreachTensorInplace(std::vector<IValue>& args, int64_t begin, int64_t end,
     if (ivalue.isTensorList()) {
       auto list = ivalue.toTensorList();
       for (const auto list_idx : c10::irange(0, list.size())) {
-        list[list_idx] = func(list[list_idx]);
+        list[list_idx] = func(list[list_idx], skipped);
       }
       args[idx] = list;
     }
@@ -328,7 +354,7 @@ void foreachTensorInplace(std::vector<IValue>& args, int64_t begin, int64_t end,
       continue;
     }
     Tensor value = ivalue.toTensor();
-    Tensor replacement = func(value);
+    Tensor replacement = func(value, skipped);
     args[idx] = std::move(replacement);
     // sanity checks
     if (ivalue.toTensor().defined()) {
@@ -371,6 +397,20 @@ bool isInplaceOp(const FunctionSchema& schema) {
   return return_alias_info && return_alias_info->isWrite();
 }
 
+std::map<int64_t, int64_t> findAliasedInputs(const FunctionSchema& schema) {
+  const auto inputs = schema.arguments();
+  const auto returns = schema.returns();
+  std::map<int64_t, int64_t> alias_map;
+  for (size_t res = 0; res != returns.size(); ++res) {
+    for (size_t inp = 0; inp != inputs.size(); ++inp) {
+      if (schema.may_contain_alias(SchemaArgument(SchemaArgType::input, inp), SchemaArgument(SchemaArgType::output, res))) {
+        alias_map[inp] = res;
+        break;  // for everything currently in native_functions, each inputs aliases at most one output
+      }
+    }
+  }
+  return alias_map;
+}
 
 #ifdef HAS_TORCH_SHOW_DISPATCH_TRACE
 static void dump_local_tls() {
