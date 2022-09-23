@@ -45,7 +45,7 @@ from torch.onnx import (  # noqa: F401
     symbolic_helper,
 )
 from torch.onnx._globals import GLOBALS
-from torch.onnx._internal import _beartype, registration
+from torch.onnx._internal import _beartype, diagnostics, registration
 
 __all__ = [
     "is_in_onnx_export",
@@ -174,6 +174,20 @@ def setup_onnx_logging(verbose: bool):
 
 @contextlib.contextmanager
 @_beartype.beartype
+def _setup_onnx_diagnostic():
+    engine = diagnostics.engine
+    _previous_context = diagnostics.context
+    diagnostics.context = engine.start_diagnostic_context(
+        diagnostics.ExportDiagnosticTool()
+    )
+    try:
+        yield diagnostics.context
+    finally:
+        diagnostics.context = _previous_context
+
+
+@contextlib.contextmanager
+@_beartype.beartype
 def exporter_context(model, mode: _C_onnx.TrainingMode, verbose: bool):
     with select_model_mode_for_export(
         model, mode
@@ -181,8 +195,8 @@ def exporter_context(model, mode: _C_onnx.TrainingMode, verbose: bool):
         model
     ) as apex_ctx, setup_onnx_logging(
         verbose
-    ) as log_ctx:
-        yield (mode_ctx, apex_ctx, log_ctx)
+    ) as log_ctx, _setup_onnx_diagnostic() as diagnostic_ctx:
+        yield (mode_ctx, apex_ctx, log_ctx, diagnostic_ctx)
 
 
 @_beartype.beartype
@@ -834,7 +848,11 @@ def _trace(func, args, operator_export_type, return_outs=False):
         args = (args,)
 
     trace_graph, torch_out, inputs_states = torch.jit._get_trace_graph(
-        func, args, strict=False, _force_outplace=False, _return_inputs_states=True
+        func,
+        args,
+        strict=False,
+        _force_outplace=False,
+        _return_inputs_states=True,
     )
     warn_on_static_input_change(inputs_states)
 
@@ -858,7 +876,11 @@ def _trace_and_get_graph_from_model(model, args):
     # ONNX runtimes can also apply CSE optimization to compensate the lack of cache here
     torch.set_autocast_cache_enabled(False)
     trace_graph, torch_out, inputs_states = torch.jit._get_trace_graph(
-        model, args, strict=False, _force_outplace=False, _return_inputs_states=True
+        model,
+        args,
+        strict=False,
+        _force_outplace=False,
+        _return_inputs_states=True,
     )
     torch.set_autocast_cache_enabled(prev_autocast_cache_enabled)
 
@@ -913,7 +935,8 @@ def _check_flatten_did_not_remove(original, jit_flattened):
 
 
 def _create_jit_graph(
-    model: Union[torch.nn.Module, torch.jit.ScriptFunction], args: Sequence[Any]
+    model: Union[torch.nn.Module, torch.jit.ScriptFunction],
+    args: Sequence[Any],
 ) -> Tuple[
     _C.Graph,
     List[_C.IValue],
@@ -1447,7 +1470,9 @@ def _export(
         symbolic_helper._set_operator_export_type(operator_export_type)
         with exporter_context(model, training, verbose):
             val_keep_init_as_ip = _decide_keep_init_as_input(
-                keep_initializers_as_inputs, operator_export_type, opset_version
+                keep_initializers_as_inputs,
+                operator_export_type,
+                opset_version,
             )
             val_add_node_names = _decide_add_node_names(
                 add_node_names, operator_export_type
@@ -1680,7 +1705,9 @@ def _add_output_to_block(block: _C.Block, value: _C.Value):
 
 @_beartype.beartype
 def _should_aten_fallback(
-    name: str, opset_version: int, operator_export_type: _C_onnx.OperatorExportTypes
+    name: str,
+    opset_version: int,
+    operator_export_type: _C_onnx.OperatorExportTypes,
 ):
     is_exportable_aten_op = registration.registry.is_registered_op(name, opset_version)
     is_onnx_aten_export = operator_export_type == _C_onnx.OperatorExportTypes.ONNX_ATEN
@@ -1790,7 +1817,10 @@ def _run_symbolic_function(
             attrs["outputs"] = outputs
             # `overload_name` is set for non-Caffe2 builds only
             return g.at(  # type: ignore[attr-defined]
-                op_name, *inputs, overload_name=_get_aten_op_overload_name(n), **attrs
+                op_name,
+                *inputs,
+                overload_name=_get_aten_op_overload_name(n),
+                **attrs,
             )
 
         raise errors.UnsupportedOperatorError(
@@ -1815,7 +1845,10 @@ def _run_symbolic_function(
                 for k in n.attributeNames()
             }
             return g.at(  # type: ignore[attr-defined]
-                op_name, *inputs, overload_name=_get_aten_op_overload_name(n), **attrs
+                op_name,
+                *inputs,
+                overload_name=_get_aten_op_overload_name(n),
+                **attrs,
             )
         raise
     except TypeError as e:
@@ -1869,7 +1902,8 @@ def register_custom_op_symbolic(
     _verify_custom_op_name(symbolic_name)
 
     versions = range(
-        max(_constants.ONNX_MIN_OPSET, opset_version), _constants.ONNX_MAX_OPSET + 1
+        max(_constants.ONNX_MIN_OPSET, opset_version),
+        _constants.ONNX_MAX_OPSET + 1,
     )
     registration.custom_onnx_symbolic(symbolic_name, versions)(symbolic_fn)
 
