@@ -2,8 +2,16 @@ import copy
 import re
 import torch
 import torch.nn as nn
-from torch.ao.quantization import QuantType, QConfig
-from torch.ao.quantization.backend_config import BackendConfig
+from torch.ao.quantization import (
+    QConfig,
+    QuantType,
+)
+from torch.ao.quantization.backend_config import (
+    BackendConfig,
+    DTypeWithConstraints,
+)
+from torch.ao.quantization.fake_quantize import FakeQuantize
+from torch.ao.quantization.observer import ObserverBase
 from torch.ao.quantization.stubs import DeQuantStub
 from torch.ao.quantization.utils import (
     activation_is_statically_quantized,
@@ -945,3 +953,50 @@ def _reroute_tuple_getitem_pattern(graph: Graph):
         new_input = first_tuple.args[0][last_getitem_index]  # type: ignore[index]
         for user in list(last_getitem.users.keys()):
             user.replace_input_with(last_getitem, new_input)
+
+def _maybe_validate_activation_post_process_dtype_constraints(
+        activation_post_process: Union[ObserverBase, FakeQuantize, None],
+        dtype_with_constraints: Optional[DTypeWithConstraints]):
+    """
+    Validate whether `activation_post_process` satisfies the following constraints from the backend,
+    specified through `dtype_with_constraints`:
+
+        1. Activation post process specified a quantization range that falls within the backend's, if any
+        2. Activation post process specified a min scale value that is >= the backend's, if any
+
+    If any of the above constraints are not satisfied, throw an error highlighting the offending values.
+
+    If either `activation_post_process` or `dtype_with_constraints` is None, or their dtypes do not match,
+    then do not validate.
+    """
+    if activation_post_process is None or \
+            dtype_with_constraints is None or \
+            activation_post_process.dtype != dtype_with_constraints.dtype:
+        return
+    debug_string = "Observer" if isinstance(activation_post_process, ObserverBase) else "FakeQuantize"
+    app_quant_min = getattr(activation_post_process, "quant_min", None)
+    app_quant_max = getattr(activation_post_process, "quant_max", None)
+    # TODO: for now, just use the existing eps value as scale_min. In the future, we should
+    # resolve the differences between the two, either by renaming eps or some other way
+    app_scale_min = getattr(activation_post_process, "eps", None)
+    backend_quant_min = dtype_with_constraints.quant_min_lower_bound
+    backend_quant_max = dtype_with_constraints.quant_max_upper_bound
+    backend_scale_min = dtype_with_constraints.scale_min_lower_bound
+    # validate quantization ranges
+    if backend_quant_min is not None and backend_quant_max is not None:
+        if app_quant_min is None or app_quant_max is None:
+            raise ValueError("%s must specify 'quant_min' and 'quant_max':\n%s" %
+                             (debug_string, activation_post_process))
+        elif app_quant_min < backend_quant_min or app_quant_max > backend_quant_max:
+            raise ValueError(("%s quantization range must fall within the backend's:\n"
+                             "%s = (%s, %s), BackendConfig = (%s, %s)\n%s") %
+                             (debug_string, debug_string, app_quant_min, app_quant_max,
+                             backend_quant_min, backend_quant_max, activation_post_process))
+    # validate scale min
+    if backend_scale_min is not None:
+        if app_scale_min is None:
+            raise ValueError("%s must specify 'eps':\n%s" % (debug_string, activation_post_process))
+        elif app_scale_min < backend_scale_min:
+            raise ValueError(("%s eps (%s) must be greater than or equal to "
+                             "the backend's min scale value (%s):\n%s") %
+                             (debug_string, app_scale_min, backend_scale_min, activation_post_process))
