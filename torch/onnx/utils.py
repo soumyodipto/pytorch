@@ -38,7 +38,6 @@ import torch.serialization
 from torch import _C
 from torch.onnx import (  # noqa: F401
     _constants,
-    _deprecation,
     _exporter_states,
     _patch_torch,
     errors,
@@ -46,7 +45,7 @@ from torch.onnx import (  # noqa: F401
     symbolic_helper,
 )
 from torch.onnx._globals import GLOBALS
-from torch.onnx._internal import _beartype, registration, torchscript
+from torch.onnx._internal import _beartype, dispatch, registration, torchscript
 
 __all__ = [
     "is_in_onnx_export",
@@ -1798,10 +1797,9 @@ def _run_symbolic_function(
             domain = namespace
         symbolic_function_name = f"{domain}::{op_name}"
 
-        symbolic_function_group = registration.registry.get_function_group(
-            symbolic_function_name
-        )
-        if symbolic_function_group is not None:
+        if registration.registry.is_registered_op(
+            symbolic_function_name, opset_version
+        ):
             attrs = {
                 k: symbolic_helper._node_get(node, k) for k in node.attributeNames()
             }
@@ -1809,7 +1807,9 @@ def _run_symbolic_function(
             # this is inconsistent with regular op symbolic.
             if op_name == "PythonOp":
                 inputs = (node, *inputs)
-            return symbolic_function_group(graph_context, *inputs, **attrs)
+            return dispatch.symbolics(symbolic_function_name)(
+                graph_context, *inputs, **attrs
+            )
 
         attrs = {
             k + "_" + node.kindOf(k)[0]: symbolic_helper._node_get(node, k)
